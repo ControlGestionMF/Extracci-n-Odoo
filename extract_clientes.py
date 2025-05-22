@@ -103,8 +103,8 @@ def main():
         print(f"Columnas: {list(df_clientes.columns)}")
         
         # Opcional: Guardar en CSV
-        # df_clientes.to_csv('clientes_odoo.csv', index=False)
-        # print("Datos guardados en clientes_odoo.csv")
+        df_clientes.to_csv('clientes_odoo.csv', index=False)
+        print("Datos guardados en clientes_odoo.csv")
         
     except Exception as e:
         print(f"\nError durante la ejecución: {str(e)}")
