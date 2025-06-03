@@ -1,6 +1,7 @@
 import xmlrpc.client
 import pandas as pd
 
+# Configuración de conexión
 url = 'https://movingfood.konos.cl'
 db = 'movingfood-mfood-erp-main-7481157'
 username = 'logistica@movingfood.cl'
@@ -17,8 +18,9 @@ def conectar_odoo():
 def extraer_facturas(uid, models, batch_size=100, max_records=5000):
     fields = [
         'id', 'name', 'move_type', 'invoice_date', 'partner_id', 'amount_total',
-        'amount_residual', 'invoice_origin', 'invoice_payment_term_id',
-        'currency_id', 'state', 'create_date', 'journal_id'
+        'amount_residual', 'amount_untaxed', 'invoice_origin',
+        'invoice_payment_term_id', 'currency_id', 'state', 'create_date',
+        'journal_id', 'l10n_latam_document_type_id', 'partner_shipping_id'
     ]
 
     offset = 0
@@ -28,7 +30,7 @@ def extraer_facturas(uid, models, batch_size=100, max_records=5000):
         facturas = models.execute_kw(
             db, uid, api_key,
             'account.move', 'search_read',
-            [[]],  # Sin filtros para traer todas
+            [[('state', '=', 'posted'), ('move_type', 'in', ['out_invoice', 'out_refund'])]],
             {
                 'fields': fields,
                 'limit': batch_size,
@@ -44,30 +46,81 @@ def extraer_facturas(uid, models, batch_size=100, max_records=5000):
         print(f"Descargadas {len(all_facturas)} facturas...")
 
         if len(all_facturas) >= max_records:
-            all_facturas = all_facturas[:max_records]  # Cortar a max_records
+            all_facturas = all_facturas[:max_records]
             break
 
     df = pd.DataFrame(all_facturas)
 
     # Procesar campos Many2one
-    df['partner_id_name'] = df['partner_id'].apply(lambda v: v[1] if isinstance(v, (list, tuple)) and v else None)
-    df['invoice_payment_term_id_name'] = df['invoice_payment_term_id'].apply(lambda v: v[1] if isinstance(v, (list, tuple)) and v else None)
-    df['currency_id_name'] = df['currency_id'].apply(lambda v: v[1] if isinstance(v, (list, tuple)) and v else None)
-    df['journal_id_name'] = df['journal_id'].apply(lambda v: v[1] if isinstance(v, (list, tuple)) and v else None)
+    df['id_cliente'] = df['partner_id'].apply(lambda v: v[0] if isinstance(v, (list, tuple)) and v else None)
+    df['cliente'] = df['partner_id'].apply(lambda v: v[1] if isinstance(v, (list, tuple)) and v else None)
+    df['plazo_pago'] = df['invoice_payment_term_id'].apply(lambda v: v[1] if isinstance(v, (list, tuple)) and v else None)
+    df['moneda'] = df['currency_id'].apply(lambda v: v[1] if isinstance(v, (list, tuple)) and v else None)
+    df['diario'] = df['journal_id'].apply(lambda v: v[1] if isinstance(v, (list, tuple)) and v else None)
+    df['tipo_documento'] = df['l10n_latam_document_type_id'].apply(lambda v: v[1] if isinstance(v, (list, tuple)) and v else None)
+    df['id_direccion_entrega'] = df['partner_shipping_id'].apply(lambda v: v[0] if isinstance(v, (list, tuple)) and v else None)
+    df['direccion_entrega'] = df['partner_shipping_id'].apply(lambda v: v[1] if isinstance(v, (list, tuple)) and v else None)
 
+    # Obtener RUT
+    partner_ids = df['id_cliente'].dropna().unique().tolist()
+    partner_ruts = {}
+    if partner_ids:
+        partners_data = models.execute_kw(
+            db, uid, api_key,
+            'res.partner', 'read',
+            [partner_ids],
+            {'fields': ['id', 'vat']}
+        )
+        partner_ruts = {p['id']: p.get('vat', '') for p in partners_data}
+    df['rut'] = df['id_cliente'].apply(lambda x: partner_ruts.get(x, ''))
+
+    # Obtener impuestos
+    factura_ids = df['id'].tolist()
+    impuestos_por_factura = {}
+    tax_ids = set()
+
+    lines = models.execute_kw(
+        db, uid, api_key,
+        'account.move.line', 'search_read',
+        [[('move_id', 'in', factura_ids)]],
+        {'fields': ['move_id', 'tax_ids']}
+    )
+
+    for line in lines:
+        move_id_raw = line.get('move_id')
+        move_id = move_id_raw[0] if isinstance(move_id_raw, (list, tuple)) and move_id_raw else move_id_raw
+
+        for tid in line.get('tax_ids', []):
+            if move_id not in impuestos_por_factura:
+                impuestos_por_factura[move_id] = set()
+            impuestos_por_factura[move_id].add(tid)
+            tax_ids.add(tid)
+
+    impuestos_data = []
+    if tax_ids:
+        impuestos_data = models.execute_kw(
+            db, uid, api_key,
+            'account.tax', 'read',
+            [list(tax_ids)],
+            {'fields': ['id', 'name']}
+        )
+
+    tax_map = {t['id']: t['name'] for t in impuestos_data}
+
+    df['impuestos'] = df['id'].apply(
+        lambda fid: " | ".join([tax_map.get(tid, str(tid)) for tid in impuestos_por_factura.get(fid, [])])
+    )
+
+    # Renombrar columnas
     df = df.rename(columns={
         'id': 'id_documento',
-        'name': 'numero',
-        'move_type': 'tipo_documento',
+        'name': 'folio',
         'invoice_date': 'fecha_emision',
         'amount_total': 'monto_total',
         'amount_residual': 'monto_pendiente',
+        'amount_untaxed': 'base_imponible',
         'invoice_origin': 'referencia_origen',
         'create_date': 'fecha_creacion',
-        'partner_id_name': 'cliente',
-        'invoice_payment_term_id_name': 'plazo_pago',
-        'currency_id_name': 'moneda',
-        'journal_id_name': 'diario',
         'state': 'estado'
     })
 
@@ -81,9 +134,10 @@ def extraer_facturas(uid, models, batch_size=100, max_records=5000):
     df['estado'] = df['estado'].map(estado_map).fillna(df['estado'])
 
     columnas = [
-        'id_documento', 'numero', 'tipo_documento', 'fecha_emision', 'cliente',
-        'monto_total', 'monto_pendiente', 'referencia_origen', 'plazo_pago',
-        'moneda', 'estado', 'fecha_creacion', 'diario'
+        'id_documento', 'folio', 'tipo_documento', 'fecha_emision', 'cliente', 'id_cliente', 'rut',
+        'monto_total', 'base_imponible', 'monto_pendiente', 'referencia_origen',
+        'plazo_pago', 'moneda', 'estado', 'fecha_creacion',
+        'id_direccion_entrega', 'direccion_entrega', 'diario', 'impuestos'
     ]
 
     return df[columnas]
@@ -93,7 +147,7 @@ def main():
         print("Conectando a Odoo...")
         uid, models = conectar_odoo()
 
-        print("Extrayendo facturas (hasta 5,000 más recientes)...")
+        print("Extrayendo facturas de venta y notas de crédito...")
         df_facturas = extraer_facturas(uid, models)
 
         print("\nMuestra de facturas extraídas:")
